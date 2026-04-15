@@ -20,28 +20,28 @@ go build ./...
 
 ```bash
 go run . \
-  -ssh-addr 203.0.113.10:22 \
-  -ssh-user tunnel \
-  -ssh-key ~/.ssh/id_ed25519 \
-  -remote-bind 127.0.0.1:18080 \
-  -target-https https://localhost:8443 \
-  -record-dir ./sessions
+  --ssh-addr 203.0.113.10:22 \
+  --ssh-user tunnel \
+  --ssh-key ~/.ssh/id_ed25519 \
+  --remote-bind 127.0.0.1:18080 \
+  --target-https https://localhost:8443 \
+  --record-dir ./sessions
 ```
 
 Or use password auth:
 
 ```bash
 go run . \
-  -ssh-addr 203.0.113.10:22 \
-  -ssh-user tunnel \
-  -ssh-password 'secret'
+  --ssh-addr 203.0.113.10:22 \
+  --ssh-user tunnel \
+  --ssh-password 'secret'
 ```
 
 ## Important Flags
 
-- `-ssh-insecure-host-key` (default: `true`): skips SSH host key verification.
-- `-ssh-known-hosts`: use when host key verification is enabled.
-- `-request-body-limit` and `-response-body-limit`: max bytes captured per exchange. `0` means unlimited.
+- `--ssh-insecure-host-key` (default: `true`): skips SSH host key verification.
+- `--ssh-known-hosts`: use when host key verification is enabled.
+- `--request-body-limit` and `--response-body-limit`: max bytes captured per exchange. `0` means unlimited.
 
 ## Session Recording
 

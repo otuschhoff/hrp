@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -185,54 +185,72 @@ func (l *loggingResponseWriter) Push(target string, opts *http.PushOptions) erro
 	return p.Push(target, opts)
 }
 
-func parseConfig() config {
-	var cfg config
-
-	flag.StringVar(&cfg.SSHAddr, "ssh-addr", "", "SSH server address host:port")
-	flag.StringVar(&cfg.SSHUser, "ssh-user", "", "SSH username")
-	flag.StringVar(&cfg.SSHPassword, "ssh-password", "", "SSH password (optional if using key auth)")
-	flag.StringVar(&cfg.SSHPrivateKeyPath, "ssh-key", "", "Path to SSH private key (optional)")
-	flag.StringVar(&cfg.SSHKnownHostsPath, "ssh-known-hosts", "", "Path to known_hosts file")
-	flag.BoolVar(&cfg.SSHInsecureHostKey, "ssh-insecure-host-key", true, "Skip SSH host key verification")
-	flag.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server")
-	flag.StringVar(&cfg.TargetHTTPS, "target-https", "https://localhost:8443", "Target HTTPS server URL")
-	flag.StringVar(&cfg.RecordDir, "record-dir", "./sessions", "Directory where per-session logs are written")
-	flag.Int64Var(&cfg.RequestBodyLimitB, "request-body-limit", 10*1024*1024, "Max request body bytes to store per exchange (0 = unlimited)")
-	flag.Int64Var(&cfg.ResponseBodyLimitB, "response-body-limit", 10*1024*1024, "Max response body bytes to store per exchange (0 = unlimited)")
-	flag.DurationVar(&cfg.IdleTimeout, "idle-timeout", 120*time.Second, "HTTP idle timeout per proxied connection")
-	flag.DurationVar(&cfg.ReadHeaderTimeout, "read-header-timeout", 10*time.Second, "HTTP read header timeout")
-	flag.DurationVar(&cfg.ShutdownGracePeriod, "shutdown-grace", 3*time.Second, "Grace period before forcibly closing session server")
-	flag.Parse()
-
-	return cfg
-}
-
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	cfg := parseConfig()
+	if err := newRootCmd().Execute(); err != nil {
+		log.Fatalf("command failed: %v", err)
+	}
+}
+
+func newRootCmd() *cobra.Command {
+	var cfg config
+
+	cmd := &cobra.Command{
+		Use:   "hrp",
+		Short: "SSH remote-bind HTTP reverse proxy to localhost HTTPS",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runApp(cfg)
+		},
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	flags := cmd.Flags()
+	flags.StringVar(&cfg.SSHAddr, "ssh-addr", "", "SSH server address host:port")
+	flags.StringVar(&cfg.SSHUser, "ssh-user", "", "SSH username")
+	flags.StringVar(&cfg.SSHPassword, "ssh-password", "", "SSH password (optional if using key auth)")
+	flags.StringVar(&cfg.SSHPrivateKeyPath, "ssh-key", "", "Path to SSH private key (optional)")
+	flags.StringVar(&cfg.SSHKnownHostsPath, "ssh-known-hosts", "", "Path to known_hosts file")
+	flags.BoolVar(&cfg.SSHInsecureHostKey, "ssh-insecure-host-key", true, "Skip SSH host key verification")
+	flags.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server")
+	flags.StringVar(&cfg.TargetHTTPS, "target-https", "https://localhost:8443", "Target HTTPS server URL")
+	flags.StringVar(&cfg.RecordDir, "record-dir", "./sessions", "Directory where per-session logs are written")
+	flags.Int64Var(&cfg.RequestBodyLimitB, "request-body-limit", 10*1024*1024, "Max request body bytes to store per exchange (0 = unlimited)")
+	flags.Int64Var(&cfg.ResponseBodyLimitB, "response-body-limit", 10*1024*1024, "Max response body bytes to store per exchange (0 = unlimited)")
+	flags.DurationVar(&cfg.IdleTimeout, "idle-timeout", 120*time.Second, "HTTP idle timeout per proxied connection")
+	flags.DurationVar(&cfg.ReadHeaderTimeout, "read-header-timeout", 10*time.Second, "HTTP read header timeout")
+	flags.DurationVar(&cfg.ShutdownGracePeriod, "shutdown-grace", 3*time.Second, "Grace period before forcibly closing session server")
+
+	_ = cmd.MarkFlagRequired("ssh-addr")
+	_ = cmd.MarkFlagRequired("ssh-user")
+
+	return cmd
+}
+
+func runApp(cfg config) error {
 
 	if err := validateConfig(cfg); err != nil {
-		log.Fatalf("invalid config: %v", err)
+		return fmt.Errorf("invalid config: %w", err)
 	}
 
 	if err := os.MkdirAll(cfg.RecordDir, 0o755); err != nil {
-		log.Fatalf("create record dir: %v", err)
+		return fmt.Errorf("create record dir: %w", err)
 	}
 
 	targetURL, err := url.Parse(cfg.TargetHTTPS)
 	if err != nil {
-		log.Fatalf("parse target URL: %v", err)
+		return fmt.Errorf("parse target URL: %w", err)
 	}
 
 	sshClient, err := connectSSH(cfg)
 	if err != nil {
-		log.Fatalf("SSH connect failed: %v", err)
+		return fmt.Errorf("SSH connect failed: %w", err)
 	}
 	defer sshClient.Close()
 
 	remoteListener, err := sshClient.Listen("tcp", cfg.RemoteBindAddr)
 	if err != nil {
-		log.Fatalf("remote listen failed on %q: %v", cfg.RemoteBindAddr, err)
+		return fmt.Errorf("remote listen failed on %q: %w", cfg.RemoteBindAddr, err)
 	}
 	defer remoteListener.Close()
 
@@ -248,7 +266,7 @@ func main() {
 				log.Printf("accept temporary error: %v", err)
 				continue
 			}
-			log.Fatalf("accept error: %v", err)
+			return fmt.Errorf("accept error: %w", err)
 		}
 
 		sessionID := makeSessionID(atomic.AddUint64(&seq, 1))
