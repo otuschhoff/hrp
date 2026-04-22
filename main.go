@@ -365,6 +365,8 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 	if len(keyPaths) > 0 {
 		keyCallback := func() ([]ssh.Signer, error) {
 			signers := make([]ssh.Signer, 0, len(keyPaths))
+			cachedPassphrase := ""
+			hasCachedPassphrase := false
 			for _, keyPath := range keyPaths {
 				key, err := os.ReadFile(keyPath)
 				if err != nil {
@@ -381,17 +383,25 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 					// If parsing failed due to encryption, prompt for passphrase.
 					errMsg := err.Error()
 					if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") || strings.Contains(errMsg, "permission denied") {
-						passphrase, err := promptPassphraseForKey(keyPath)
-						if err != nil {
-							return nil, fmt.Errorf("passphrase prompt failed for %q: %w", keyPath, err)
+						// Try previously entered passphrase first to avoid re-prompting.
+						if hasCachedPassphrase {
+							signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(cachedPassphrase))
 						}
-						signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
-						if err != nil {
-							if cfg.SSHPrivateKeyPath != "" {
-								return nil, fmt.Errorf("parse private key with passphrase %q: %w", keyPath, err)
+						if !hasCachedPassphrase || err != nil {
+							passphrase, promptErr := promptPassphraseForKey(keyPath)
+							if promptErr != nil {
+								return nil, fmt.Errorf("passphrase prompt failed for %q: %w", keyPath, promptErr)
 							}
-							log.Printf("skip default SSH key %q (passphrase parse failed): %v", keyPath, err)
-							continue
+							signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
+							if err != nil {
+								if cfg.SSHPrivateKeyPath != "" {
+									return nil, fmt.Errorf("parse private key with passphrase %q: %w", keyPath, err)
+								}
+								log.Printf("skip default SSH key %q (passphrase parse failed): %v", keyPath, err)
+								continue
+							}
+							cachedPassphrase = passphrase
+							hasCachedPassphrase = true
 						}
 					} else {
 						if cfg.SSHPrivateKeyPath != "" {
