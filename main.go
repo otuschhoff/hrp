@@ -362,32 +362,35 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 		}
 	}
 
-	// Try to load the private key
+	// Try to load the private key using a callback for robust passphrase handling
 	if keyPath != "" {
-		key, err := os.ReadFile(keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("read private key: %w", err)
-		}
-
-		// Try to parse without passphrase first
-		signer, err := ssh.ParsePrivateKey(key)
-		if err != nil {
-			// If parsing failed due to encryption, prompt for passphrase
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") {
-				passphrase, err := promptPassphrase()
-				if err != nil {
-					return nil, fmt.Errorf("passphrase prompt failed: %w", err)
-				}
-				signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
-				if err != nil {
-					return nil, fmt.Errorf("parse private key with passphrase: %w", err)
-				}
-			} else {
-				return nil, fmt.Errorf("parse private key: %w", err)
+		keyCallback := func() ([]ssh.Signer, error) {
+			key, err := os.ReadFile(keyPath)
+			if err != nil {
+				return nil, fmt.Errorf("read private key: %w", err)
 			}
+
+			// Try to parse without passphrase first
+			signer, err := ssh.ParsePrivateKey(key)
+			if err != nil {
+				// If parsing failed due to encryption, prompt for passphrase
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") || strings.Contains(errMsg, "permission denied") {
+					passphrase, err := promptPassphrase()
+					if err != nil {
+						return nil, fmt.Errorf("passphrase prompt failed: %w", err)
+					}
+					signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
+					if err != nil {
+						return nil, fmt.Errorf("parse private key with passphrase: %w", err)
+					}
+				} else {
+					return nil, fmt.Errorf("parse private key: %w", err)
+				}
+			}
+			return []ssh.Signer{signer}, nil
 		}
-		methods = append(methods, ssh.PublicKeys(signer))
+		methods = append(methods, ssh.PublicKeysCallback(keyCallback))
 	}
 
 	if len(methods) == 0 {
