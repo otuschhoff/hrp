@@ -38,6 +38,7 @@ type config struct {
 	SSHPrivateKeyPath   string
 	SSHKnownHostsPath   string
 	SSHInsecureHostKey  bool
+	Verbose             bool
 	RemoteBindAddr      string
 	TargetHTTPS         string
 	RecordDir           string
@@ -214,6 +215,7 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&cfg.SSHPrivateKeyPath, "ssh-key", "", "Path to SSH private key (optional)")
 	flags.StringVar(&cfg.SSHKnownHostsPath, "ssh-known-hosts", "", "Path to known_hosts file")
 	flags.BoolVar(&cfg.SSHInsecureHostKey, "ssh-insecure-host-key", true, "Skip SSH host key verification")
+	flags.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose diagnostics for proxy and upstream behavior")
 	flags.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server (can be just a port number for 127.0.0.1:port)")
 	flags.StringVar(&cfg.TargetHTTPS, "target-https", "https://localhost:8443", "Target HTTPS server URL")
 	flags.StringVar(&cfg.RecordDir, "record-dir", "./sessions", "Directory where per-session logs are written")
@@ -257,7 +259,11 @@ func runApp(cfg config) error {
 
 	log.Printf("SSH connected to %s, serving remote TCP %s -> %s", cfg.SSHAddr, cfg.RemoteBindAddr, cfg.TargetHTTPS)
 
-	proxy := makeProxy(targetURL)
+	if cfg.Verbose {
+		log.Printf("verbose enabled: ssh=%s remote-bind=%s target=%s", cfg.SSHAddr, cfg.RemoteBindAddr, cfg.TargetHTTPS)
+	}
+
+	proxy := makeProxy(targetURL, cfg)
 	var seq uint64
 
 	for {
@@ -478,7 +484,7 @@ func buildHostKeyCallback(cfg config) (ssh.HostKeyCallback, error) {
 	return knownhosts.New(knownHostsPath)
 }
 
-func makeProxy(target *url.URL) *httputil.ReverseProxy {
+func makeProxy(target *url.URL, cfg config) *httputil.ReverseProxy {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 
 	originalDirector := proxy.Director
@@ -487,7 +493,7 @@ func makeProxy(target *url.URL) *httputil.ReverseProxy {
 		req.Host = target.Host
 	}
 
-	proxy.Transport = &http.Transport{
+	baseTransport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -500,9 +506,18 @@ func makeProxy(target *url.URL) *httputil.ReverseProxy {
 			MinVersion:         tls.VersionTLS12,
 		},
 	}
+	if cfg.Verbose {
+		proxy.Transport = &verboseRoundTripper{next: baseTransport}
+	} else {
+		proxy.Transport = baseTransport
+	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("proxy error for %s %s: %v", r.Method, r.URL.String(), err)
+		if cfg.Verbose {
+			log.Printf("proxy error for %s %s: %v (req_ctx_err=%v)", r.Method, r.URL.String(), err, r.Context().Err())
+		} else {
+			log.Printf("proxy error for %s %s: %v", r.Method, r.URL.String(), err)
+		}
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
 
@@ -512,8 +527,14 @@ func makeProxy(target *url.URL) *httputil.ReverseProxy {
 func serveSession(conn net.Conn, sessionID string, proxy *httputil.ReverseProxy, rec *recorder, cfg config) {
 	defer conn.Close()
 	defer rec.close()
+	listener := newSingleConnListener(conn)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		if cfg.Verbose {
+			log.Printf("session %s: request start %s %s host=%s from=%s", sessionID, r.Method, r.URL.String(), r.Host, r.RemoteAddr)
+		}
+
 		requestCapture := captureRequestBody(r, cfg.RequestBodyLimitB)
 		lrw := newLoggingResponseWriter(w, cfg.ResponseBodyLimitB)
 
@@ -545,6 +566,10 @@ func serveSession(conn net.Conn, sessionID string, proxy *httputil.ReverseProxy,
 		if err := rec.write(record); err != nil {
 			log.Printf("session %s: write record failed: %v", sessionID, err)
 		}
+
+		if cfg.Verbose {
+			log.Printf("session %s: request done %s %s status=%d duration=%s", sessionID, r.Method, r.URL.String(), lrw.statusCode, time.Since(start))
+		}
 	})
 
 	srv := &http.Server{
@@ -556,7 +581,7 @@ func serveSession(conn net.Conn, sessionID string, proxy *httputil.ReverseProxy,
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
-		if err := srv.Serve(&singleConnListener{conn: conn}); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("session %s: serve error: %v", sessionID, err)
 		}
 	}()
@@ -567,6 +592,22 @@ func serveSession(conn net.Conn, sessionID string, proxy *httputil.ReverseProxy,
 	_ = srv.Shutdown(ctx)
 
 	log.Printf("session %s: closed", sessionID)
+}
+
+type verboseRoundTripper struct {
+	next http.RoundTripper
+}
+
+func (v *verboseRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	start := time.Now()
+	log.Printf("upstream start: %s %s host=%s", req.Method, req.URL.String(), req.Host)
+	resp, err := v.next.RoundTrip(req)
+	if err != nil {
+		log.Printf("upstream error: %s %s err=%T %v duration=%s", req.Method, req.URL.String(), err, err, time.Since(start))
+		return nil, err
+	}
+	log.Printf("upstream done: %s %s status=%d duration=%s", req.Method, req.URL.String(), resp.StatusCode, time.Since(start))
+	return resp, nil
 }
 
 func captureRequestBody(r *http.Request, limit int64) bodyCapture {
@@ -635,16 +676,27 @@ func makeSessionID(seq uint64) string {
 type singleConnListener struct {
 	conn net.Conn
 	used atomic.Bool
+	done chan struct{}
+	once sync.Once
+}
+
+func newSingleConnListener(conn net.Conn) *singleConnListener {
+	return &singleConnListener{
+		conn: conn,
+		done: make(chan struct{}),
+	}
 }
 
 func (s *singleConnListener) Accept() (net.Conn, error) {
 	if s.used.Swap(true) {
+		<-s.done
 		return nil, net.ErrClosed
 	}
-	return s.conn, nil
+	return &trackedConn{Conn: s.conn, onClose: s.signalDone}, nil
 }
 
 func (s *singleConnListener) Close() error {
+	s.signalDone()
 	if s.conn != nil {
 		return s.conn.Close()
 	}
@@ -656,6 +708,24 @@ func (s *singleConnListener) Addr() net.Addr {
 		return s.conn.LocalAddr()
 	}
 	return &net.TCPAddr{}
+}
+
+func (s *singleConnListener) signalDone() {
+	s.once.Do(func() {
+		close(s.done)
+	})
+}
+
+type trackedConn struct {
+	net.Conn
+	onClose func()
+	once    sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.onClose)
+	return err
 }
 
 func isTemporary(err error) bool {
