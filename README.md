@@ -87,7 +87,7 @@ go run . \
 
 ## SSH Authentication
 
-- If `--ssh-key` is not specified, hrp automatically tries to use the first available default SSH key from `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, or `~/.ssh/id_rsa`.
+- If `--ssh-key` is not specified, hrp automatically tries all available default SSH keys from `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, and `~/.ssh/id_rsa`.
 - If the SSH key is encrypted (password-protected), hrp will prompt you to enter the passphrase on stdin.
 - Alternatively, provide `--ssh-password` for password-based SSH authentication.
 

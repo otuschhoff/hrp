@@ -353,42 +353,62 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 		methods = append(methods, ssh.Password(cfg.SSHPassword))
 	}
 
-	// Determine key path: use explicit path or try default keys
-	keyPath := cfg.SSHPrivateKeyPath
-	if keyPath == "" {
-		defaultPath := findDefaultSSHKey()
-		if defaultPath != "" {
-			keyPath = defaultPath
-		}
+	// Determine key paths: use explicit key, otherwise try all common defaults.
+	keyPaths := make([]string, 0, 4)
+	if cfg.SSHPrivateKeyPath != "" {
+		keyPaths = append(keyPaths, cfg.SSHPrivateKeyPath)
+	} else {
+		keyPaths = findDefaultSSHKeys()
 	}
 
-	// Try to load the private key using a callback for robust passphrase handling
-	if keyPath != "" {
+	// Load all valid private keys so SSH can try each signer during auth.
+	if len(keyPaths) > 0 {
 		keyCallback := func() ([]ssh.Signer, error) {
-			key, err := os.ReadFile(keyPath)
-			if err != nil {
-				return nil, fmt.Errorf("read private key: %w", err)
+			signers := make([]ssh.Signer, 0, len(keyPaths))
+			for _, keyPath := range keyPaths {
+				key, err := os.ReadFile(keyPath)
+				if err != nil {
+					if cfg.SSHPrivateKeyPath != "" {
+						return nil, fmt.Errorf("read private key %q: %w", keyPath, err)
+					}
+					log.Printf("skip unreadable default SSH key %q: %v", keyPath, err)
+					continue
+				}
+
+				// Try to parse without passphrase first.
+				signer, err := ssh.ParsePrivateKey(key)
+				if err != nil {
+					// If parsing failed due to encryption, prompt for passphrase.
+					errMsg := err.Error()
+					if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") || strings.Contains(errMsg, "permission denied") {
+						passphrase, err := promptPassphraseForKey(keyPath)
+						if err != nil {
+							return nil, fmt.Errorf("passphrase prompt failed for %q: %w", keyPath, err)
+						}
+						signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
+						if err != nil {
+							if cfg.SSHPrivateKeyPath != "" {
+								return nil, fmt.Errorf("parse private key with passphrase %q: %w", keyPath, err)
+							}
+							log.Printf("skip default SSH key %q (passphrase parse failed): %v", keyPath, err)
+							continue
+						}
+					} else {
+						if cfg.SSHPrivateKeyPath != "" {
+							return nil, fmt.Errorf("parse private key %q: %w", keyPath, err)
+						}
+						log.Printf("skip default SSH key %q (parse failed): %v", keyPath, err)
+						continue
+					}
+				}
+
+				signers = append(signers, signer)
 			}
 
-			// Try to parse without passphrase first
-			signer, err := ssh.ParsePrivateKey(key)
-			if err != nil {
-				// If parsing failed due to encryption, prompt for passphrase
-				errMsg := err.Error()
-				if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") || strings.Contains(errMsg, "permission denied") {
-					passphrase, err := promptPassphrase()
-					if err != nil {
-						return nil, fmt.Errorf("passphrase prompt failed: %w", err)
-					}
-					signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
-					if err != nil {
-						return nil, fmt.Errorf("parse private key with passphrase: %w", err)
-					}
-				} else {
-					return nil, fmt.Errorf("parse private key: %w", err)
-				}
+			if len(signers) == 0 {
+				return nil, errors.New("no usable SSH private keys found")
 			}
-			return []ssh.Signer{signer}, nil
+			return signers, nil
 		}
 		methods = append(methods, ssh.PublicKeysCallback(keyCallback))
 	}
@@ -399,10 +419,10 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 	return methods, nil
 }
 
-func findDefaultSSHKey() string {
+func findDefaultSSHKeys() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return nil
 	}
 
 	// Try common default key locations
@@ -412,16 +432,17 @@ func findDefaultSSHKey() string {
 		filepath.Join(home, ".ssh", "id_rsa"),
 	}
 
+	found := make([]string, 0, len(defaultKeys))
 	for _, path := range defaultKeys {
 		if _, err := os.Stat(path); err == nil {
-			return path
+			found = append(found, path)
 		}
 	}
-	return ""
+	return found
 }
 
-func promptPassphrase() (string, error) {
-	fmt.Print("Enter passphrase for SSH key: ")
+func promptPassphraseForKey(keyPath string) (string, error) {
+	fmt.Printf("Enter passphrase for SSH key %s: ", keyPath)
 	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err
