@@ -80,6 +80,18 @@ go run . \
   --ssh-password 'secret'
 ```
 
+Behind an external reverse proxy mounted on a path prefix:
+
+```bash
+go run . \
+  --ssh-addr partner-test.eu.socionext.com \
+  --ssh-user root \
+  --remote-bind 3333 \
+  --target-https https://localhost:300 \
+  --public-origin https://partner-test.eu.socionext.com \
+  --public-prefix /45e2383441efdf24b815a0c055227d9009a39f09
+```
+
 ## Smart Defaults
 
 - **`--ssh-addr`**: If no port is specified, defaults to port 22. Examples: `example.com` → `example.com:22`, `example.com:2222` stays as-is.
@@ -95,7 +107,17 @@ go run . \
 
 - `--ssh-insecure-host-key` (default: `true`): skips SSH host key verification.
 - `--ssh-known-hosts`: use when host key verification is enabled.
+- `--public-origin`: external origin used when rewriting backend-generated absolute URLs in proxied HTML and redirect headers.
+- `--public-prefix`: external path prefix mounted in front of hrp; also used for rewriting HTML asset paths and redirect targets.
+- `--preserve-host`: forwards the incoming `Host` header upstream instead of forcing the backend target host.
+- `--verbose`: logs request lifecycle and upstream round-trip diagnostics.
 - `--request-body-limit` and `--response-body-limit`: max bytes captured per exchange. `0` means unlimited.
+
+## Reverse Proxy Notes
+
+- If an outer reverse proxy strips a prefix before forwarding to hrp, configure that prefix with `--public-prefix` or pass it as `X-Forwarded-Prefix`.
+- hrp normalizes common nested asset requests such as `/connect/<server>/styles/...` back to `/styles/...` before proxying.
+- HTML responses are rewritten to keep asset URLs, form targets, and redirect destinations on the public origin and prefix instead of leaking backend-only addresses.
 
 ## Tasks
 

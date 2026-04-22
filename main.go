@@ -38,6 +38,9 @@ type config struct {
 	SSHPrivateKeyPath   string
 	SSHKnownHostsPath   string
 	SSHInsecureHostKey  bool
+	PublicOrigin        string
+	PublicPrefix        string
+	PreserveHost        bool
 	Verbose             bool
 	RemoteBindAddr      string
 	TargetHTTPS         string
@@ -215,6 +218,9 @@ func newRootCmd() *cobra.Command {
 	flags.StringVar(&cfg.SSHPrivateKeyPath, "ssh-key", "", "Path to SSH private key (optional)")
 	flags.StringVar(&cfg.SSHKnownHostsPath, "ssh-known-hosts", "", "Path to known_hosts file")
 	flags.BoolVar(&cfg.SSHInsecureHostKey, "ssh-insecure-host-key", true, "Skip SSH host key verification")
+	flags.StringVar(&cfg.PublicOrigin, "public-origin", "", "External public origin used for URL rewriting, e.g. https://partner-test.eu.socionext.com")
+	flags.StringVar(&cfg.PublicPrefix, "public-prefix", "", "External path prefix mounted in front of hrp, e.g. /45e2383441efdf24b815a0c055227d9009a39f09")
+	flags.BoolVar(&cfg.PreserveHost, "preserve-host", false, "Forward the incoming Host header to upstream instead of forcing the target host")
 	flags.BoolVar(&cfg.Verbose, "verbose", false, "Enable verbose diagnostics for proxy and upstream behavior")
 	flags.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server (can be just a port number for 127.0.0.1:port)")
 	flags.StringVar(&cfg.TargetHTTPS, "target-https", "https://localhost:8443", "Target HTTPS server URL")
@@ -302,6 +308,21 @@ func validateConfig(cfg *config) error {
 
 	// Normalize remote-bind: convert bare port number to 127.0.0.1:port
 	cfg.RemoteBindAddr = normalizeRemoteBindAddr(cfg.RemoteBindAddr)
+	cfg.PublicPrefix = normalizePublicPrefix(cfg.PublicPrefix)
+
+	if cfg.PublicOrigin != "" {
+		publicURL, err := url.Parse(cfg.PublicOrigin)
+		if err != nil {
+			return fmt.Errorf("invalid -public-origin: %w", err)
+		}
+		if publicURL.Scheme == "" || publicURL.Host == "" {
+			return errors.New("-public-origin must include scheme and host")
+		}
+		if publicURL.Path != "" && publicURL.Path != "/" {
+			return errors.New("-public-origin must not include a path; use -public-prefix for the path component")
+		}
+		cfg.PublicOrigin = strings.TrimRight(publicURL.String(), "/")
+	}
 
 	target, err := url.Parse(cfg.TargetHTTPS)
 	if err != nil {
@@ -330,6 +351,17 @@ func normalizeRemoteBindAddr(addr string) string {
 		return fmt.Sprintf("127.0.0.1:%d", port)
 	}
 	return addr
+}
+
+func normalizePublicPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || prefix == "/" {
+		return ""
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	return strings.TrimRight(prefix, "/")
 }
 
 func connectSSH(cfg config) (*ssh.Client, error) {
@@ -489,8 +521,27 @@ func makeProxy(target *url.URL, cfg config) *httputil.ReverseProxy {
 
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
+		originalPath := req.URL.Path
+		publicInfo := resolvePublicRequestInfo(req, cfg)
+		rewrittenPath := rewriteConnectAssetPath(req.URL.Path)
+		if rewrittenPath != req.URL.Path {
+			if cfg.Verbose {
+				log.Printf("rewrite inbound path %q -> %q", req.URL.Path, rewrittenPath)
+			}
+			req.URL.Path = rewrittenPath
+			req.URL.RawPath = rewrittenPath
+		}
+		incomingHost := req.Host
 		originalDirector(req)
-		req.Host = target.Host
+		if cfg.PreserveHost {
+			req.Host = incomingHost
+		} else {
+			req.Host = target.Host
+		}
+		applyPublicForwardedHeaders(req, publicInfo, incomingHost)
+		if cfg.Verbose && originalPath != req.URL.Path {
+			log.Printf("director outbound path %q -> %q", originalPath, req.URL.Path)
+		}
 	}
 
 	baseTransport := &http.Transport{
@@ -510,6 +561,10 @@ func makeProxy(target *url.URL, cfg config) *httputil.ReverseProxy {
 		proxy.Transport = &verboseRoundTripper{next: baseTransport}
 	} else {
 		proxy.Transport = baseTransport
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return rewriteProxyResponse(resp, target, cfg)
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
@@ -608,6 +663,265 @@ func (v *verboseRoundTripper) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	log.Printf("upstream done: %s %s status=%d duration=%s", req.Method, req.URL.String(), resp.StatusCode, time.Since(start))
 	return resp, nil
+}
+
+func rewriteConnectAssetPath(path string) string {
+	_, remainder, ok := splitConnectPath(path)
+	if !ok {
+		return path
+	}
+	for _, candidate := range []string{"/styles", "/images", "/js", "/app"} {
+		if remainder == candidate || strings.HasPrefix(remainder, candidate+"/") {
+			return remainder
+		}
+	}
+	return path
+}
+
+func splitConnectPath(path string) (string, string, bool) {
+	if !strings.HasPrefix(path, "/connect/") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, "/connect/")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return "", "", false
+	}
+	return parts[0], "/" + parts[1], true
+}
+
+type publicRequestInfo struct {
+	origin string
+	host   string
+	proto  string
+	prefix string
+}
+
+func resolvePublicRequestInfo(req *http.Request, cfg config) publicRequestInfo {
+	info := publicRequestInfo{}
+	if cfg.PublicOrigin != "" {
+		if publicURL, err := url.Parse(cfg.PublicOrigin); err == nil {
+			info.origin = strings.TrimRight(cfg.PublicOrigin, "/")
+			info.host = publicURL.Host
+			info.proto = publicURL.Scheme
+		}
+	}
+
+	if info.host == "" {
+		info.host = firstHeaderValue(req.Header, "X-Forwarded-Host")
+		if info.host == "" {
+			info.host = req.Host
+		}
+	}
+	if info.proto == "" {
+		info.proto = firstHeaderValue(req.Header, "X-Forwarded-Proto")
+		if info.proto == "" {
+			if req.TLS != nil {
+				info.proto = "https"
+			} else {
+				info.proto = "http"
+			}
+		}
+	}
+	if info.origin == "" && info.host != "" && info.proto != "" {
+		info.origin = info.proto + "://" + info.host
+	}
+
+	info.prefix = cfg.PublicPrefix
+	headerPrefix := firstHeaderValue(req.Header, "X-Forwarded-Prefix")
+	if headerPrefix != "" {
+		info.prefix = normalizePublicPrefix(headerPrefix)
+	}
+
+	return info
+}
+
+func firstHeaderValue(h http.Header, key string) string {
+	value := strings.TrimSpace(h.Get(key))
+	if value == "" {
+		return ""
+	}
+	parts := strings.Split(value, ",")
+	return strings.TrimSpace(parts[0])
+}
+
+func applyPublicForwardedHeaders(req *http.Request, info publicRequestInfo, incomingHost string) {
+	if info.host != "" {
+		req.Header.Set("X-Forwarded-Host", info.host)
+	} else if incomingHost != "" {
+		req.Header.Set("X-Forwarded-Host", incomingHost)
+	}
+	if info.proto != "" {
+		req.Header.Set("X-Forwarded-Proto", info.proto)
+	}
+	if info.prefix != "" {
+		req.Header.Set("X-Forwarded-Prefix", info.prefix)
+	}
+}
+
+func rewriteProxyResponse(resp *http.Response, target *url.URL, cfg config) error {
+	publicInfo := resolvePublicRequestInfo(resp.Request, cfg)
+
+	if location := resp.Header.Get("Location"); location != "" {
+		if rewritten := rewriteLocation(location, resp.Request.URL.Path, target, publicInfo); rewritten != "" && rewritten != location {
+			resp.Header.Set("Location", rewritten)
+		}
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if !strings.Contains(contentType, "text/html") {
+		return nil
+	}
+	contentEncoding := strings.TrimSpace(strings.ToLower(resp.Header.Get("Content-Encoding")))
+	if contentEncoding != "" && contentEncoding != "identity" {
+		if cfg.Verbose {
+			log.Printf("skip HTML rewrite for encoded response: %s", contentEncoding)
+		}
+		return nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if err := resp.Body.Close(); err != nil {
+		return err
+	}
+
+	rewrittenBody := rewriteHTMLBody(string(body), resp.Request.URL.Path, target, publicInfo)
+	resp.Body = io.NopCloser(strings.NewReader(rewrittenBody))
+	resp.ContentLength = int64(len(rewrittenBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(rewrittenBody)))
+	return nil
+}
+
+func rewriteLocation(location, requestPath string, target *url.URL, publicInfo publicRequestInfo) string {
+	publicPathPrefix := publicInfo.prefix
+	if strings.HasPrefix(location, "/") {
+		if publicInfo.origin == "" && publicPathPrefix == "" {
+			return ""
+		}
+		return publicInfo.origin + joinPublicPath(publicPathPrefix, location)
+	}
+
+	locationURL, err := url.Parse(location)
+	if err != nil || locationURL.Scheme == "" || locationURL.Host == "" {
+		return ""
+	}
+
+	if server, _, ok := splitConnectPath(requestPath); ok && locationURL.Path == "/agent" && samePort(locationURL, target) {
+		return publicInfo.origin + joinPublicPath(publicPathPrefix, "/connect/"+server+"/agent")
+	}
+	if sameHost(locationURL, target) {
+		return publicInfo.origin + joinPublicPath(publicPathPrefix, locationURL.Path)
+	}
+	return ""
+}
+
+func sameHost(left, right *url.URL) bool {
+	return strings.EqualFold(left.Hostname(), right.Hostname())
+}
+
+func samePort(left, right *url.URL) bool {
+	return effectivePort(left) == effectivePort(right)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return "80"
+	}
+	return ""
+}
+
+func rewriteHTMLBody(body, requestPath string, target *url.URL, publicInfo publicRequestInfo) string {
+	publicRoot := publicBasePath(publicInfo.prefix)
+	publicRootWithSlash := publicRoot
+	if !strings.HasSuffix(publicRootWithSlash, "/") {
+		publicRootWithSlash += "/"
+	}
+
+	replacements := []string{
+		`href="styles/`, `href="` + publicRootWithSlash + `styles/`,
+		`href="images/`, `href="` + publicRootWithSlash + `images/`,
+		`href="js/`, `href="` + publicRootWithSlash + `js/`,
+		`href="app/`, `href="` + publicRootWithSlash + `app/`,
+		`src="styles/`, `src="` + publicRootWithSlash + `styles/`,
+		`src="images/`, `src="` + publicRootWithSlash + `images/`,
+		`src="js/`, `src="` + publicRootWithSlash + `js/`,
+		`src="app/`, `src="` + publicRootWithSlash + `app/`,
+		`action="styles/`, `action="` + publicRootWithSlash + `styles/`,
+		`action="images/`, `action="` + publicRootWithSlash + `images/`,
+		`action="js/`, `action="` + publicRootWithSlash + `js/`,
+		`action="app/`, `action="` + publicRootWithSlash + `app/`,
+		`href='styles/`, `href='` + publicRootWithSlash + `styles/`,
+		`href='images/`, `href='` + publicRootWithSlash + `images/`,
+		`href='js/`, `href='` + publicRootWithSlash + `js/`,
+		`href='app/`, `href='` + publicRootWithSlash + `app/`,
+		`src='styles/`, `src='` + publicRootWithSlash + `styles/`,
+		`src='images/`, `src='` + publicRootWithSlash + `images/`,
+		`src='js/`, `src='` + publicRootWithSlash + `js/`,
+		`src='app/`, `src='` + publicRootWithSlash + `app/`,
+		`action='styles/`, `action='` + publicRootWithSlash + `styles/`,
+		`action='images/`, `action='` + publicRootWithSlash + `images/`,
+		`action='js/`, `action='` + publicRootWithSlash + `js/`,
+		`action='app/`, `action='` + publicRootWithSlash + `app/`,
+	}
+	body = strings.NewReplacer(replacements...).Replace(body)
+
+	if strings.Contains(body, `<base href="../../">`) {
+		body = strings.Replace(body, `<base href="../../">`, `<base href="`+publicRootWithSlash+`">`, 1)
+	}
+	if strings.Contains(body, `<base href='../../'>`) {
+		body = strings.Replace(body, `<base href='../../'>`, `<base href='`+publicRootWithSlash+`'>`, 1)
+	}
+
+	if server, _, ok := splitConnectPath(requestPath); ok {
+		backendAgentURL := target.Scheme + "://" + net.JoinHostPort(server, effectivePort(target)) + "/agent"
+		publicAgentPath := joinPublicPath(publicInfo.prefix, "/connect/"+server+"/agent")
+		if publicInfo.origin != "" {
+			publicAgentPath = publicInfo.origin + publicAgentPath
+		}
+		body = strings.ReplaceAll(body, `action="`+backendAgentURL+`"`, `action="`+publicAgentPath+`"`)
+		body = strings.ReplaceAll(body, `action='`+backendAgentURL+`'`, `action='`+publicAgentPath+`'`)
+
+		publicHome := joinPublicPath(publicInfo.prefix, "/")
+		if publicInfo.origin != "" {
+			publicHome = publicInfo.origin + publicHome
+		}
+		body = strings.ReplaceAll(body, `document.location.href = '../';`, `document.location.href = '`+publicHome+`';`)
+	}
+
+	return body
+}
+
+func joinPublicPath(prefix, path string) string {
+	prefix = normalizePublicPrefix(prefix)
+	if path == "" {
+		if prefix == "" {
+			return "/"
+		}
+		return prefix + "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if prefix == "" {
+		return path
+	}
+	return prefix + path
+}
+
+func publicBasePath(prefix string) string {
+	if prefix == "" {
+		return "/"
+	}
+	return prefix
 }
 
 func captureRequestBody(r *http.Request, limit int64) bodyCapture {
