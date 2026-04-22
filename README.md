@@ -11,18 +11,41 @@ Small Go app that:
 
 ## Build
 
+Using `xc` (task runner):
+
+```bash
+xc build
+```
+
+Or manually with Go:
+
 ```bash
 go mod tidy
 go build ./...
 ```
 
+The `xc build` target builds with CGO disabled and outputs the binary to `bin/hrp`.
+
 ## Run
+
+With explicit SSH key:
 
 ```bash
 go run . \
   --ssh-addr 203.0.113.10:22 \
   --ssh-user tunnel \
   --ssh-key ~/.ssh/id_ed25519 \
+  --remote-bind 127.0.0.1:18080 \
+  --target-https https://localhost:8443 \
+  --record-dir ./sessions
+```
+
+Or automatically use default SSH key (tries `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, `~/.ssh/id_rsa` in order):
+
+```bash
+go run . \
+  --ssh-addr 203.0.113.10:22 \
+  --ssh-user tunnel \
   --remote-bind 127.0.0.1:18080 \
   --target-https https://localhost:8443 \
   --record-dir ./sessions
@@ -37,11 +60,28 @@ go run . \
   --ssh-password 'secret'
 ```
 
+## SSH Authentication
+
+- If `--ssh-key` is not specified, hrp automatically tries to use the first available default SSH key from `~/.ssh/id_ed25519`, `~/.ssh/id_ecdsa`, or `~/.ssh/id_rsa`.
+- If the SSH key is encrypted (password-protected), hrp will prompt you to enter the passphrase on stdin.
+- Alternatively, provide `--ssh-password` for password-based SSH authentication.
+
 ## Important Flags
 
 - `--ssh-insecure-host-key` (default: `true`): skips SSH host key verification.
 - `--ssh-known-hosts`: use when host key verification is enabled.
 - `--request-body-limit` and `--response-body-limit`: max bytes captured per exchange. `0` means unlimited.
+
+## Tasks
+
+### build
+
+Build hrp with CGO disabled into bin/
+
+```sh
+mkdir -p bin
+CGO_ENABLED=0 go build -o bin/hrp .
+```
 
 ## Session Recording
 

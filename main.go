@@ -289,9 +289,6 @@ func validateConfig(cfg config) error {
 	if cfg.SSHUser == "" {
 		return errors.New("-ssh-user is required")
 	}
-	if cfg.SSHPassword == "" && cfg.SSHPrivateKeyPath == "" {
-		return errors.New("either -ssh-password or -ssh-key is required")
-	}
 	target, err := url.Parse(cfg.TargetHTTPS)
 	if err != nil {
 		return fmt.Errorf("invalid -target-https: %w", err)
@@ -331,21 +328,79 @@ func buildAuthMethods(cfg config) ([]ssh.AuthMethod, error) {
 	if cfg.SSHPassword != "" {
 		methods = append(methods, ssh.Password(cfg.SSHPassword))
 	}
-	if cfg.SSHPrivateKeyPath != "" {
-		key, err := os.ReadFile(cfg.SSHPrivateKeyPath)
+
+	// Determine key path: use explicit path or try default keys
+	keyPath := cfg.SSHPrivateKeyPath
+	if keyPath == "" {
+		defaultPath := findDefaultSSHKey()
+		if defaultPath != "" {
+			keyPath = defaultPath
+		}
+	}
+
+	// Try to load the private key
+	if keyPath != "" {
+		key, err := os.ReadFile(keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("read private key: %w", err)
 		}
+
+		// Try to parse without passphrase first
 		signer, err := ssh.ParsePrivateKey(key)
 		if err != nil {
-			return nil, fmt.Errorf("parse private key: %w", err)
+			// If parsing failed due to encryption, prompt for passphrase
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "passphrase protected") {
+				passphrase, err := promptPassphrase()
+				if err != nil {
+					return nil, fmt.Errorf("passphrase prompt failed: %w", err)
+				}
+				signer, err = ssh.ParsePrivateKeyWithPassphrase(key, []byte(passphrase))
+				if err != nil {
+					return nil, fmt.Errorf("parse private key with passphrase: %w", err)
+				}
+			} else {
+				return nil, fmt.Errorf("parse private key: %w", err)
+			}
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
+
 	if len(methods) == 0 {
-		return nil, errors.New("no SSH auth methods configured")
+		return nil, errors.New("no SSH auth methods configured (provide -ssh-password or -ssh-key, or have a default key in ~/.ssh/)")
 	}
 	return methods, nil
+}
+
+func findDefaultSSHKey() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+
+	// Try common default key locations
+	defaultKeys := []string{
+		filepath.Join(home, ".ssh", "id_ed25519"),
+		filepath.Join(home, ".ssh", "id_ecdsa"),
+		filepath.Join(home, ".ssh", "id_rsa"),
+	}
+
+	for _, path := range defaultKeys {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func promptPassphrase() (string, error) {
+	fmt.Print("Enter passphrase for SSH key: ")
+	reader := bufio.NewReader(os.Stdin)
+	passphrase, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(passphrase, "\n"), nil
 }
 
 func buildHostKeyCallback(cfg config) (ssh.HostKeyCallback, error) {
