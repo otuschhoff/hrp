@@ -28,6 +28,26 @@ The `xc build` target builds with CGO disabled and outputs the binary to `bin/hr
 
 ## Run
 
+Minimal example (with smart defaults):
+
+```bash
+go run . \
+  --ssh-addr 203.0.113.10 \
+  --ssh-user tunnel \
+  --remote-bind 18080 \
+  --target-https https://localhost:8443
+```
+
+The above is equivalent to:
+
+```bash
+go run . \
+  --ssh-addr 203.0.113.10:22 \
+  --ssh-user tunnel \
+  --remote-bind 127.0.0.1:18080 \
+  --target-https https://localhost:8443
+```
+
 With explicit SSH key:
 
 ```bash
@@ -59,6 +79,11 @@ go run . \
   --ssh-user tunnel \
   --ssh-password 'secret'
 ```
+
+## Smart Defaults
+
+- **`--ssh-addr`**: If no port is specified, defaults to port 22. Examples: `example.com` → `example.com:22`, `example.com:2222` stays as-is.
+- **`--remote-bind`**: If given a bare port number (1-65535), assumes it's a port on localhost. Examples: `8080` → `127.0.0.1:8080`, `192.168.1.1:9090` stays as-is.
 
 ## SSH Authentication
 

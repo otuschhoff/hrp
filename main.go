@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
+	"golang.org/x/term"
 )
 
 type config struct {
@@ -206,13 +208,13 @@ func newRootCmd() *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-	flags.StringVar(&cfg.SSHAddr, "ssh-addr", "", "SSH server address host:port")
+	flags.StringVar(&cfg.SSHAddr, "ssh-addr", "", "SSH server address (host or host:port; defaults to port 22 if not specified)")
 	flags.StringVar(&cfg.SSHUser, "ssh-user", "", "SSH username")
 	flags.StringVar(&cfg.SSHPassword, "ssh-password", "", "SSH password (optional if using key auth)")
 	flags.StringVar(&cfg.SSHPrivateKeyPath, "ssh-key", "", "Path to SSH private key (optional)")
 	flags.StringVar(&cfg.SSHKnownHostsPath, "ssh-known-hosts", "", "Path to known_hosts file")
 	flags.BoolVar(&cfg.SSHInsecureHostKey, "ssh-insecure-host-key", true, "Skip SSH host key verification")
-	flags.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server")
+	flags.StringVar(&cfg.RemoteBindAddr, "remote-bind", "127.0.0.1:18080", "Remote TCP listen address on SSH server (can be just a port number for 127.0.0.1:port)")
 	flags.StringVar(&cfg.TargetHTTPS, "target-https", "https://localhost:8443", "Target HTTPS server URL")
 	flags.StringVar(&cfg.RecordDir, "record-dir", "./sessions", "Directory where per-session logs are written")
 	flags.Int64Var(&cfg.RequestBodyLimitB, "request-body-limit", 10*1024*1024, "Max request body bytes to store per exchange (0 = unlimited)")
@@ -228,8 +230,7 @@ func newRootCmd() *cobra.Command {
 }
 
 func runApp(cfg config) error {
-
-	if err := validateConfig(cfg); err != nil {
+	if err := validateConfig(&cfg); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
@@ -282,13 +283,20 @@ func runApp(cfg config) error {
 	}
 }
 
-func validateConfig(cfg config) error {
+func validateConfig(cfg *config) error {
 	if cfg.SSHAddr == "" {
 		return errors.New("-ssh-addr is required")
 	}
 	if cfg.SSHUser == "" {
 		return errors.New("-ssh-user is required")
 	}
+
+	// Normalize ssh-addr: add :22 if no port specified
+	cfg.SSHAddr = normalizeSSHAddr(cfg.SSHAddr)
+
+	// Normalize remote-bind: convert bare port number to 127.0.0.1:port
+	cfg.RemoteBindAddr = normalizeRemoteBindAddr(cfg.RemoteBindAddr)
+
 	target, err := url.Parse(cfg.TargetHTTPS)
 	if err != nil {
 		return fmt.Errorf("invalid -target-https: %w", err)
@@ -300,6 +308,22 @@ func validateConfig(cfg config) error {
 		return errors.New("-target-https host is empty")
 	}
 	return nil
+}
+
+func normalizeSSHAddr(addr string) string {
+	// If addr doesn't have a port, add :22
+	if !strings.Contains(addr, ":") {
+		return addr + ":22"
+	}
+	return addr
+}
+
+func normalizeRemoteBindAddr(addr string) string {
+	// If addr is just a number (1-65535), assume it's a port on localhost
+	if port, err := strconv.Atoi(strings.TrimSpace(addr)); err == nil && port > 0 && port <= 65535 {
+		return fmt.Sprintf("127.0.0.1:%d", port)
+	}
+	return addr
 }
 
 func connectSSH(cfg config) (*ssh.Client, error) {
@@ -395,12 +419,12 @@ func findDefaultSSHKey() string {
 
 func promptPassphrase() (string, error) {
 	fmt.Print("Enter passphrase for SSH key: ")
-	reader := bufio.NewReader(os.Stdin)
-	passphrase, err := reader.ReadString('\n')
+	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSuffix(passphrase, "\n"), nil
+	fmt.Println() // newline after hidden input
+	return string(passphrase), nil
 }
 
 func buildHostKeyCallback(cfg config) (ssh.HostKeyCallback, error) {
