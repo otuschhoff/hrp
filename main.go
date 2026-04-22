@@ -670,7 +670,7 @@ func rewriteConnectAssetPath(path string) string {
 	if !ok {
 		return path
 	}
-	for _, candidate := range []string{"/styles", "/images", "/js", "/app"} {
+	for _, candidate := range []string{"/agent", "/websockify", "/styles", "/images", "/js", "/app", "/core"} {
 		if remainder == candidate || strings.HasPrefix(remainder, candidate+"/") {
 			return remainder
 		}
